@@ -1,0 +1,144 @@
+---
+title: "Chromosome Quotient Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##### Pre CQ
+
+# CQ Analysis Overwiev
+The CQ methods relies on the simple principle that Y chromosome sequences are present only in males, which means that Y chromosome sequences should have alignments from male sequence data but no alignments from female sequence data, while autosomal sequences are expected to have roughly equal numbers of male and female alignments and X sequences are expected to have roughly twice as many female alignments as male alignments. Here, utilizing this, CQ is defined as the ratio of female-to-male alignments to the reference sequence. Since Y sequences are known to be highly repetitive, recently duplicated, or translocated; they have closely-related copies present on the autosomes and X, causing Y sequences to have alignments from female Illumina data, in where, instead of trying to ignore/eliminate this alignment, we classify a sequence as Y-linked if the CQ is less than 0.2 or 0.3 depending on the data. The state of Y sequences to be highly repetitive, recently duplicated, or translocated is also causing Y sequences to have near identical copies somewhere else, which then cause us to require perfect alignment across the length of the read to differentiate between male specific and not, in where requiring perfect stringency decreases the total number of reads aligned but dramatically increases the number of Y sequences identified as it allows to differentiate between duplications or translocations of Y sequences. Since there might be coverage differences in the Illumina datasets, in case known autosomal sequences are present, all the chromosome quotients can be normalized to the median chromosome quotient of the known autosomal sequences (Hall, 2016; Hall et al, 2013). Also, the male to female coverage ratio is typically a continuum, where there are two overlapping normal distributions of sex differences in coverage, one for the X or Y chromosome and the other for autosomal scaffolds. Identifying the equidistant point between the maximum of these two peaks can help minimize the error in identifying sex-linked regions, and has been employed successfully across a number of species (Palmer, 2019)
+
+# Details to Fine
+--> Depth calculation will be done over different bins. The thing here is that the smaller the bins get more false positives we'll see and bigger the bins get more false negatives we'll see, so it really is a balance here. This is why we'll just try out a bunch with small and big bins to calculate CQ values on and decide what looks good to us. We'll also try with both full contigs as Navarro 2021 did on a scaffold scale up to 1MB sequences and for example 50KB non-overlapping bins as He&Jia 2021 did, and even smaller as long as the false positive number doesn't go through the roof
+
+
+
+##### CQ
+
+### Align female and male sequence data to reference sequences
+alignments with:
+  - bowtie2 -p 10 -k 4 --no-unal --no-discordant --score-min L,0,-0 -x <indexprefix> -1 <R1.fq> -2 <R2.fq> -S <output.sam>
+        -k 4 so that it searches for at most 4 valid alignments for each read, reporting them all 
+        --no-unal so that the unaligned reads are not reported in the SAM file
+        --no-discordant so that discordant alignments are suppressed for paired ends
+        --score-min L,0,-0 so that reads can only align perfectly or with one mismatch
+                           so that untangle dups/translocs of Y sequences anywhere in the genome
+                           so that still identify it as a Y sequence even tho it is up to 97% similar
+        index offrate set to 2 so that the slowed down process by k option can be evened out by small offrate
+        
+alignment results:
+        - MI aabys male illumina data aligned to MI contigs with 55.51% overall alignment rate
+        - MI aabys female illumina data aligned to MI contigs with 34.83% overall alignment rate
+        - MI contigs are produced by Gröningen group by assembling MI aabys male genome PacBio reads with canu
+
+alignment conversion
+  - sam to bam:
+          * samtools view -S -b file.sam > file.bam
+          * samtools sort file.bam -o sorted_file.bam
+          * samtools index sorted_file.bam
+
+
+### Compute the read depth at every contig
+read depth with:
+  - samtools coverage alignment.bam -o depth.txt
+       -coverage produces a table of coverage per chromosome
+       -meandepth mean depth of coverage, what we want per chromosome
+        
+
+### Calculation, Normalization, Plotting
+
+calculate:
+  - the meandepth for each contig already calculated with samtools
+  - what we can do is to use it to calculate raw CQ for each contig
+```{r calculate}
+depthF <- read.csv("CQ/Depths/contigScale/MIaabys_female_on_MIcontigs_depth_perContig.txt", header = T, sep = "\t")   # load depth F
+depthM <- read.csv("CQ/Depths/contigScale/MIaabys_male_on_MIcontigs_depth_perContig.txt", header = T, sep = "\t")     # load depth M
+
+length <- depthF[,c(1,3)]; colnames(length) <- c("contig","length")             # get the lengths of the contigs, adjust col names
+depthF <- depthF[,c(1,7)]; colnames(depthF) <- c("contig","meandepth_F")        # get the mean depth of contigs, F, adjust col names
+depthM <- depthM[,c(1,7)]; colnames(depthM) <- c("contig","meandepth_M")        # get the mean depth of contigs, M, adjust col names
+
+CQtable    <- merge(depthF,depthM, by = "contig")                               # merge the data together to one table
+CQtable    <- merge(length,CQtable, by = "contig")                              # merge the data together to one table
+
+CQtable    <- CQtable[which(CQtable$meandepth_M != 0),]                         # get rid of contigs with male depth = 0 since num/0 = infinite
+CQtable    <- CQtable[which(CQtable$meandepth_M >= 1),]                         # get rid of contigs with male coverage lower than %1
+
+CQtable$rawCQ <- CQtable$meandepth_F / CQtable$meandepth_M                      # calculate CQ!!!
+ 
+summary(CQtable$rawCQ)
+```
+
+
+normalize
+  - since there are coverage differences between Illumina datasets we'll normalize the CQ to the median chromosome quotient of the known autosomal genes,
+  - where all these genes are found as single copy in the MI aabys genome, and we take also the flanking regions of the genes so that the normalization is 
+  - on a wider range for hopefully more accurate normalization, in where we find the coverage in these chromosomal regions with samtools coverage for both 
+  - male and female illumina again, with usage: samtools coverage -r chr:start-end alignment.bam -o depth.txt; where the chosen genes are in the order
+            * MDOA001944 fruitless                      --> tig00008420:52591910-52891909
+            * MDOA003329 zona pellucida-like protein    --> tig00003130:555749-855748
+            * MDOA001063 homeotic protein antennapedia  --> tig00008420:46824935-47124934
+ 
+  - it seemed that, for the chosen flanked autosomal regions, where the CQ was expected to be 1, it was 1.37 due to read depth difference between the two
+  - Illumina reads, therefore, we normalized the raw CQ values by multiplying them with 1/1.37; this is also in line with the finding that while the 
+  - female illumina data seem to have 52x coverage, male data has 38x coverage, and the coverage difference seem to be 1.36
+            
+```{r normalize}
+normF <- read.csv("CQ/Depths/controlGenes/MIaabys_female_on_controls.txt", header = T, sep = "\t")   # load depth F
+normM <- read.csv("CQ/Depths/controlGenes/MIaabys_male_on_controls.txt", header = T, sep = "\t")     # load depth M
+
+normF       <- normF[,c(1,7)]; colnames(normF) <- c("contig","meandepth_F")        # get the mean depth of contigs, F, adjust col names
+normM       <- normM[,c(1,7)]; colnames(normM) <- c("contig","meandepth_M")        # get the mean depth of contigs, M, adjust col names
+normCQtable <- merge(normF,normM, by = "contig")                                   # merge the data together to one table
+
+normCQtable$rawCQ <- normCQtable$meandepth_F / normCQtable$meandepth_M             # calculate raw CQ
+avgCQ             <- sum(normCQtable$rawCQ)/3                                      # seems that for autosomal regions, we had CQ 1,37 
+                                                                                   # instead of expected 1 due to illumina read depth diff
+                                                                                   # we'll normalize the whole table for this
+
+coeff          <- 1/avgCQ                                                          # coefficient to normalize CQ with 
+CQtable$normCQ <- CQtable$rawCQ*coeff                                              # all raw CQ normalized
+
+summary(CQtable$normCQ)
+```
+
+
+write
+  - write the final version of the table as output
+  - as merged with synteny data too so that can be seen as one
+```{r write}
+synteny <- read.xlsx("http://imlspenticton.uzh.ch/dump/ece/cDNA/MachineLearning/PredictedData/MI_contigs_predicted.xlsx") # load synteny
+synteny <- synteny[,c(1,16)]; colnames(synteny) <- c("contig","allocation")                                               # get what you need
+
+write.table(merge(CQtable, synteny), file = "CQ/Results/CQtable_withSynteny.txt", quote = F, row.names = F)               # merge and write
+```
+
+
+plot
+  - plot CQ in a length vs CQ value plot for the contigs, just so that it's easier to see on two dimensions
+```{r plot}
+fullT  <- merge(CQtable, synteny)                           # get full contigs 
+chr2LT <- fullT[which(fullT$allocation == "2L"),]           # get only contigs mapping to 2L
+
+
+plot(log10(fullT$normCQ)~log10(fullT$length), ylab = "log10(CQ)", xlab = "log10(length)", main = "CQ, all contigs",        
+     sub = paste0(nrow(fullT[which(fullT$normCQ <= 0.2),])," contigs seem to be under the cutoff CQ <= 0.2"))         
+     abline(h=log10(0.2), col="2") 
+
+
+plot(log10(chr2LT$normCQ)~log10(chr2LT$length), ylab = "log10(CQ)", xlab = "log10(length)", main = "CQ, contigs mapping to 2L",       
+     sub = paste0(nrow(chr2LT[which(chr2LT$normCQ <= 0.6),])," contigs seem to be under the cutoff CQ <= 0.6"))         
+     abline(h=log10(0.6), col="2") 
+```
+
+
+
+### References
+Hall 2016: url http://hdl.handle.net/10919/78883; Hall 2013: doi 10.1186/1471-2164-14-273; Palmer 2019: doi 10.1111/mec.15245; Navarro 2021: doi 10.1038/s41598-021-84068-1; He&Jia 2021: doi 10.1111/1755-0998.13362
+
+
+
